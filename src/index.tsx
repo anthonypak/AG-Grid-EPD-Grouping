@@ -316,16 +316,16 @@ const GridExample = () => {
                 
                 console.log(`Calling RPC get_distinct_groups_v1 with:`, {
                      grouping_column: dbGroupingColName,
-                     parent_filters: parentFiltersObject,
+                    // parent_filters: parentFiltersObject // Temporarily removed for v1.9
                     // column_filters: columnFiltersObject // Future enhancement
                  });
 
                 // 3. Call the Supabase RPC function
                 const { data: rpcData, error: rpcError } = await supabase.rpc(
                     'get_distinct_groups_v1', 
-                    {
-                        grouping_column: dbGroupingColName,
-                        parent_filters: parentFiltersObject
+                    { // Pass ONLY grouping_column for v1.9
+                        grouping_column: dbGroupingColName
+                        // parent_filters: parentFiltersObject // Temporarily removed for v1.9
                         // Pass column_filters here when implemented
                     }
                 );
