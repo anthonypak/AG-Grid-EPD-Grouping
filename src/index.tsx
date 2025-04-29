@@ -296,54 +296,69 @@ const GridExample = () => {
                 params.fail();
                 return;
             }
-            console.log(`[ServerSideDatasource] Requesting GROUP level ${groupKeys.length} for column: ${dbGroupingColName}`);
+            console.log(`[ServerSideDatasource] Requesting GROUP level ${groupKeys.length} for column: ${dbGroupingColName} (using RPC)`);
             
-            // Base query for grouping
-            let groupQueryBase = supabase.from('EPD');
-            groupQueryBase = applyParentFilters(groupQueryBase); // Apply filters from parent groups
-            // Apply regular column filters as well
-            // Select only the grouping column for distinct check
-            let groupQuery = applyFilters(groupQueryBase.select(dbGroupingColName, { count: 'exact' }), filterModel); 
-
-            // --- Simplified Group Fetching (Not Scalable - Needs RPC for Production) --- 
+            // --- RPC-Based Group Fetching --- 
             try {
-                // Attempt to get distinct values - very inefficient for large tables
-                groupQuery = groupQuery.order(dbGroupingColName, { ascending: true }); 
-                // Limit the scan range - this means we might miss groups!
-                groupQuery = groupQuery.range(0, 1000); // Example limit
+                // 1. Prepare Parent Filters for RPC
+                const parentFiltersObject: { [key: string]: any } = {};
+                groupKeys.forEach((key, index) => {
+                    const parentColId = rowGroupCols[index].id;
+                    const parentDbColName = getDbColumnName(parentColId);
+                    if (parentDbColName) {
+                        parentFiltersObject[parentDbColName] = key; // Use DB name as key
+                    }
+                });
 
-                console.log(`Executing Supabase GROUP query for ${dbGroupingColName}`, { groupKeys, filterModel });
-                const { data, error, count } = await groupQuery;
-
-                if (error) throw error;
-
-                // Extract distinct, non-null values from the limited data fetched
-                const distinctGroups = Array.from(new Set(data?.map(row => row[groupingColId]))) // Use original field name for mapping back
-                                          .filter(groupVal => groupVal !== null && groupVal !== undefined) // Filter out null/undefined groups
-                                          .map(groupVal => ({ [groupingColId]: groupVal })); // Format for grid using original field name
-
-                console.log(`Found ${distinctGroups.length} distinct groups (limited scan) for ${dbGroupingColName}`);
+                // 2. Prepare Column Filters (Simplified for V1 - passing empty object)
+                // TODO: Enhance SQL function and this part to handle column filters if needed
+                const columnFiltersObject = {}; // Pass empty for V1
                 
-                // Since we limited the scan, we don't know the true total group count. 
-                // Pass -1 to AG-Grid to indicate unknown count (triggers infinite scroll for groups).
-                // Alternatively, if count represents total rows matching filters (not distinct groups), it's less useful here.
-                params.success({ rowData: distinctGroups, rowCount: -1 }); // Indicate unknown total group count
+                console.log(`Calling RPC get_distinct_groups_v1 with:`, {
+                     grouping_column: dbGroupingColName,
+                     parent_filters: parentFiltersObject,
+                    // column_filters: columnFiltersObject // Future enhancement
+                 });
+
+                // 3. Call the Supabase RPC function
+                const { data: rpcData, error: rpcError } = await supabase.rpc(
+                    'get_distinct_groups_v1', 
+                    {
+                        grouping_column: dbGroupingColName,
+                        parent_filters: parentFiltersObject
+                        // Pass column_filters here when implemented
+                    }
+                );
+
+                if (rpcError) throw rpcError;
+
+                // 4. Process RPC results
+                const distinctGroups = (rpcData || []).map((item: any) => {
+                    // The RPC returns { group_value: <actual_value> }
+                    // We need to map it back to { [agGridField]: <actual_value> }
+                    return { [groupingColId]: item.group_value }; 
+                }).filter(group => group[groupingColId] !== null && group[groupingColId] !== undefined);
+
+                console.log(`RPC returned ${distinctGroups.length} distinct groups for ${dbGroupingColName}`);
+                
+                // We now know the exact count of distinct groups for this level
+                params.success({ rowData: distinctGroups, rowCount: distinctGroups.length }); 
 
             } catch (err) {
-                console.error(`Error fetching GROUP data for ${dbGroupingColName}:`, err);
+                console.error(`Error fetching GROUP data via RPC for ${dbGroupingColName}:`, err);
                 params.fail();
             }
-            // --- End Simplified Group Fetching --- 
+            // --- End RPC-Based Group Fetching --- 
 
         } else {
             // --- Request for Leaf Rows --- 
             console.log('[ServerSideDatasource] Requesting LEAF rows within group:', groupKeys);
             
-            // Base query for leaf rows
-            let leafQueryBase = supabase.from('EPD');
+            // Select first, then apply filters
+            let leafQueryBase = supabase.from('EPD').select('*', { count: 'exact' }); // SELECT * + count first
             leafQueryBase = applyParentFilters(leafQueryBase); // Apply filters from parent groups
             // Apply regular column filters
-            let leafQuery = applyFilters(leafQueryBase.select('*', { count: 'exact' }), filterModel);
+            let leafQuery = applyFilters(leafQueryBase, filterModel); // Apply column filters
 
             // Apply sorting
             if (sortModel && sortModel.length > 0) {
@@ -360,41 +375,36 @@ const GridExample = () => {
             }
 
             // Apply pagination (range)
-            const pageStartRow = startRow ?? 0;
-            // Use cacheBlockSize from gridOptions or default if endRow is missing
-            const cacheBlockSize = gridRef.current?.api?.getGridOption('cacheBlockSize') ?? 100;
-            const pageEndRow = endRow ?? (pageStartRow + cacheBlockSize);
-            leafQuery = leafQuery.range(pageStartRow, pageEndRow - 1);
+            const startRow = params.request.startRow ?? 0;
+            const endRow = params.request.endRow ?? startRow + 100; // Use cacheBlockSize for default range
+            const pageSize = endRow - startRow;
+            leafQuery = leafQuery.range(startRow, endRow - 1); // Supabase range is inclusive
 
-            // Execute the query
+            console.log(`Executing Supabase LEAF query: range(${startRow}, ${endRow - 1})`, { groupKeys, sortModel, filterModel });
+
             try {
-                console.log(`Executing Supabase LEAF query: range(${pageStartRow}, ${pageEndRow - 1})`, { groupKeys, sortModel, filterModel });
                 const { data, error, count } = await leafQuery;
 
-                if (error) {
-                    console.error('Supabase LEAF fetch error:', error);
-                    params.fail();
-                } else if (data) {
-                    const totalRowCount = count ?? 0; // Total leaf rows matching filters *within this group*
-                    const currentPageRowCount = data.length;
-                    console.log(`Supabase LEAF fetch success: Received ${currentPageRowCount} rows. Total count for group: ${totalRowCount}`);
-                    const lastRow = totalRowCount < 0 ? -1 : totalRowCount; 
-                    params.success({ 
-                        rowData: data,
-                        rowCount: lastRow, 
-                    });
-                } else {
-                    console.log('Supabase returned no LEAF data and no error.');
-                    params.success({ rowData: [], rowCount: 0 });
-                }
+                if (error) throw error;
+
+                const rowsThisPage = data || [];
+                // Use the 'count' from the query for total rows in this group/level
+                const totalRowCount = count ?? 0;
+
+                console.log(`Supabase LEAF fetch success: Received ${rowsThisPage.length} rows. Total count for group: ${totalRowCount}`);
+
+                // Calculate the last row index based on the count
+                const lastRow = totalRowCount <= endRow ? totalRowCount : -1; // -1 indicates more rows exist
+
+                params.success({ rowData: rowsThisPage, rowCount: lastRow });
             } catch (err) {
-                console.error('Error executing Supabase LEAF query:', err);
+                console.error('Error fetching LEAF data:', err);
                 params.fail();
             }
         }
       },
     };
-  }, [supabase]); // Add supabase as dependency
+  }, [supabase, columnDefs, defaultColDef, autoGroupColumnDef]); // Ensure all dependencies used in getRows are listed
 
   return (
     <div style={containerStyle}>
