@@ -11,22 +11,28 @@ import React, {
 import { createRoot } from "react-dom/client";
 import { AgGridReact } from "ag-grid-react";
 import {
-  ClientSideRowModelModule,
   ColDef,
   ColGroupDef,
   GridApi,
   GridOptions,
   ModuleRegistry,
-  ValidationModule,
-  PaginationModule,
+  IServerSideDatasource,
+  IServerSideGetRowsParams,
   TextFilterModule,
   NumberFilterModule,
   RowSelectionModule,
 } from "ag-grid-community";
-import { LicenseManager, RowGroupingModule, MenuModule, ColumnsToolPanelModule, RowGroupingPanelModule } from "ag-grid-enterprise";
+import {
+  LicenseManager,
+  RowGroupingModule,
+  MenuModule,
+  ColumnsToolPanelModule,
+  RowGroupingPanelModule,
+  ServerSideRowModelModule,
+} from "ag-grid-enterprise";
 
 // Add missing Supabase import
-import { createClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 const supabaseUrl = 'https://khxbcgqtjvomylwvnwta.supabase.co';
 const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeGJjZ3F0anZvbXlsd3Zud3RhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDU4ODM5MDgsImV4cCI6MjA2MTQ1OTkwOH0.OprhgtAk4uvRc37yhPZkj0UkGNK5YTjzLI1IY_gikVc';
@@ -35,9 +41,7 @@ const supabase = createClient(supabaseUrl, supabaseAnonKey);
 LicenseManager.setLicenseKey("[TRIAL]_this_{AG_Charts_and_AG_Grid}_Enterprise_key_{AG-086015}_is_granted_for_evaluation_only___Use_in_production_is_not_permitted___Please_report_misuse_to_legal@ag-grid.com___For_help_with_purchasing_a_production_key_please_contact_info@ag-grid.com___You_are_granted_a_{Single_Application}_Developer_License_for_one_application_only___All_Front-End_JavaScript_developers_working_on_the_application_would_need_to_be_licensed___This_key_will_deactivate_on_{14 May 2025}____[v3]_[0102]_MTc0NzE3NzIwMDAwMA==1127112b2eb5fda550f75b9d26691ef0");
 
 ModuleRegistry.registerModules([
-  ClientSideRowModelModule,
-  ValidationModule /* Development Only */,
-  PaginationModule,
+  ServerSideRowModelModule,
   TextFilterModule,
   NumberFilterModule,
   RowGroupingModule,
@@ -47,13 +51,156 @@ ModuleRegistry.registerModules([
   RowGroupingPanelModule,
 ]);
 
+// --- Column Mapping --- 
+// Maps AG-Grid field names to exact (quoted) Supabase column names
+const columnMapping: { [key: string]: string } = {
+  'Masterformat': '"Masterformat"',
+  'Material Category': '"Material Category"',
+  'Material Subcategory': '"Material Subcategory"',
+  'Country': '"Country"', // Quote even simple names for consistency
+  'Datapoint Type': '"Datapoint Type"',
+  'Plant Name': '"Plant Name"',
+  'Manufacturer': '"Manufacturer"',
+  'Default Unit': '"Default Unit"',
+  'Product Name': '"Product Name"',
+  'Product Description': '"Product Description"',
+  'EC3 Uncertainty Factor (%)': '"EC3 Uncertainty Factor (%)"',
+  'GWP Fossil + Biogenic (kgCO2e)': '"GWP Fossil + Biogenic (kgCO2e)"',
+  'GWP per Default Unit': '"GWP per Default Unit"',
+  'GWPbio per Default Unit': '"GWPbio per Default Unit"',
+  // Add any other relevant columns here if used in filters/sorts/groups
+  // Make sure the keys exactly match the 'field' property in your columnDefs
+};
+
+// Helper to get the DB column name from AG-Grid field
+const getDbColumnName = (agGridField: string): string => {
+  // Attempt to find in mapping, default to quoting the input field name
+  // It's safer to ensure all mapped columns are explicitly in columnMapping
+  const mappedName = columnMapping[agGridField];
+  if (!mappedName) {
+      console.warn(`Column field '${agGridField}' not found in columnMapping. Attempting to quote directly. Add it to the mapping for reliability.`);
+      // Basic quoting - might fail for complex names not intended
+      return `"${agGridField}"`; 
+  }
+  return mappedName;
+};
+
+// Helper function to map AG-Grid filter types to Supabase filters
+const applyFilters = (query: any, filterModel: any) => {
+  if (!filterModel || Object.keys(filterModel).length === 0) {
+    return query; // No filters applied
+  }
+
+  console.log("Applying filters:", filterModel);
+
+  Object.keys(filterModel).forEach(colId => {
+    const filter = filterModel[colId];
+    // IMPORTANT: Use the mapping here!
+    const columnName = getDbColumnName(colId);
+    if (!columnName) return; // Skip if column name couldn't be resolved
+
+    // Handle combined filters (AND/OR) - AG Grid usually sends simple filters per column
+    // or condition filters. We'll handle the simple case first.
+    if (filter.operator) {
+        console.warn(`Filter operator ${filter.operator} not fully implemented yet.`);
+        // Basic AND handling for two conditions
+        if (filter.operator === 'AND' && filter.condition1 && filter.condition2) {
+             // Apply condition 1 (recursive or direct call might be needed)
+             // Apply condition 2
+        } else if (filter.operator === 'OR' && filter.condition1 && filter.condition2) {
+             // Needs Supabase .or() syntax
+        }
+        // For now, only process simple filters
+        return;
+    }
+
+    switch (filter.filterType) {
+      case 'text':
+        // Use ilike for case-insensitive matching
+        switch (filter.type) {
+          case 'contains':
+            query = query.ilike(columnName, `%${filter.filter}%`);
+            break;
+          case 'notContains':
+            // Supabase doesn't have a direct 'not ilike'. Combine 'not' and 'ilike'.
+            query = query.not('ilike', columnName, `%${filter.filter}%`);
+            break;
+          case 'equals':
+            query = query.eq(columnName, filter.filter);
+            break;
+          case 'notEqual':
+            query = query.neq(columnName, filter.filter);
+            break;
+          case 'startsWith':
+            query = query.ilike(columnName, `${filter.filter}%`);
+            break;
+          case 'endsWith':
+             query = query.ilike(columnName, `%${filter.filter}`);
+            break;
+          default:
+            console.warn(`Unsupported text filter type: ${filter.type} for column ${columnName}`);
+        }
+        break;
+
+      case 'number':
+        const numValue = Number(filter.filter);
+         if (isNaN(numValue)) {
+            console.warn(`Invalid number filter value for ${columnName}: ${filter.filter}`);
+            break;
+         }
+        switch (filter.type) {
+          case 'equals':
+            query = query.eq(columnName, numValue);
+            break;
+          case 'notEqual':
+            query = query.neq(columnName, numValue);
+            break;
+          case 'lessThan':
+            query = query.lt(columnName, numValue);
+            break;
+          case 'lessThanOrEqual':
+            query = query.lte(columnName, numValue);
+            break;
+          case 'greaterThan':
+            query = query.gt(columnName, numValue);
+            break;
+          case 'greaterThanOrEqual':
+            query = query.gte(columnName, numValue);
+            break;
+          case 'inRange':
+             const numValueTo = Number(filter.filterTo);
+             if (isNaN(numValueTo)) {
+                console.warn(`Invalid number filter 'to' value for ${columnName}: ${filter.filterTo}`);
+                break;
+             }
+            query = query.gte(columnName, numValue).lte(columnName, numValueTo);
+            break;
+          default:
+            console.warn(`Unsupported number filter type: ${filter.type} for column ${columnName}`);
+        }
+        break;
+      
+      // Add 'set' filter support if using agSetColumnFilter
+      case 'set':
+         if (filter.values && Array.isArray(filter.values) && filter.values.length > 0) {
+             query = query.in(columnName, filter.values);
+         } else {
+             console.warn(`Invalid set filter values for ${columnName}:`, filter.values);
+         }
+         break;
+
+      default:
+        console.warn(`Unsupported filter type: ${filter.filterType} for column ${columnName}`);
+    }
+  });
+
+  return query;
+};
+
 const GridExample = () => {
   const containerStyle = useMemo(() => ({ width: "100%", height: "100%" }), []);
   const gridStyle = useMemo(() => ({ height: "100%", width: "100%" }), []);
-
-  const [rowData, setRowData] = useState<any[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
+  const gridRef = useRef<AgGridReact>(null);
 
   const [columnDefs, setColumnDefs] = useState<ColDef[]>([
     { field: 'Masterformat', headerName: 'Masterformat', filter: true, sortable: true, enableRowGroup: true },
@@ -77,6 +224,8 @@ const GridExample = () => {
       flex: 1,
       minWidth: 150,
       resizable: true,
+      sortable: true,
+      filter: true,
     };
   }, []);
 
@@ -85,64 +234,181 @@ const GridExample = () => {
       headerName: 'Material Group',
       minWidth: 250,
       field: 'Product Name',
-      cellRenderer: 'agGroupCellRenderer',
+      cellRendererParams: {
+        suppressCount: true,
+      },
     };
   }, []);
 
-  useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true);
-      setError(null);
-      console.log('Fetching data from Supabase EPD table...');
-      const { data, error, count } = await supabase
-        .from('EPD')
-        .select('*', { count: 'exact' });
+  const serverSideDatasource = useMemo<IServerSideDatasource>(() => {
+    return {
+      getRows: async (params: IServerSideGetRowsParams) => {
+        console.log('[ServerSideDatasource] Requesting rows:', params.request);
+        const { startRow, endRow, sortModel, filterModel, rowGroupCols, groupKeys } = params.request;
 
-      if (error) {
-        console.error('Supabase fetch error:', error);
-        setError(`Failed to load data: ${error.message}`);
-        setRowData([]);
-      } else if (data) {
-        console.log(`Supabase fetch success: Received ${data.length} rows.`);
-        console.log('First row data:', data.length > 0 ? data[0] : 'N/A');
-        console.log(`Total row count from Supabase: ${count}`);
-        setRowData(data);
-      } else {
-        console.log('Supabase fetch returned no data and no error.');
-        setRowData([]);
-      }
-      setLoading(false);
+        // Determine if it's a group request or leaf request
+        const isGrouping = rowGroupCols.length > groupKeys.length;
+
+        // Apply parent group filters (applies to both group and leaf requests within a group)
+        const applyParentFilters = (currentQuery: any) => {
+            console.log("[Debug] applyParentFilters called with Group Keys:", groupKeys);
+            console.log("[Debug] Initial currentQuery type:", typeof currentQuery, "Has .eq?", typeof currentQuery?.eq === 'function');
+            let filteredQuery = currentQuery;
+            groupKeys.forEach((key, index) => {
+                const colId = rowGroupCols[index].id;
+                const dbColName = getDbColumnName(colId); // Use mapped name
+                if (!dbColName) {
+                    console.warn(`[Debug] Skipping parent filter for unmapped column: ${colId}`);
+                    return; // Continue to next key
+                }
+
+                console.log(`[Debug] Applying parent filter: ${dbColName} eq ${key}`);
+                // --- Debugging Check --- 
+                if (typeof filteredQuery?.eq !== 'function') {
+                    console.error(`[Debug] Error: filteredQuery is not a valid query object before applying .eq('${dbColName}', '${key}')!`, filteredQuery);
+                    // To prevent crash, maybe return the current object or throw
+                    // For now, let's skip this filter to see if others work
+                    console.error('[Debug] Skipping this filter application due to invalid query object.');
+                    return; // Continue to next key, though the query might be broken
+                } 
+                // --- End Debugging Check ---
+                
+                try {
+                    filteredQuery = filteredQuery.eq(dbColName, key); 
+                    console.log("[Debug] filteredQuery type after .eq:", typeof filteredQuery, "Has .eq?", typeof filteredQuery?.eq === 'function');
+                } catch (e) {
+                    console.error(`[Debug] Error during filteredQuery.eq(${dbColName}, ${key}):`, e);
+                    console.error('[Debug] Query object state was:', filteredQuery);
+                    // Rethrow or handle as needed
+                    throw e; 
+                }
+            });
+            console.log("[Debug] applyParentFilters returning query:", filteredQuery);
+            return filteredQuery;
+        }
+
+        if (isGrouping) {
+            // --- Request for Group Rows --- 
+            const groupingColId = rowGroupCols[groupKeys.length].id;
+            const dbGroupingColName = getDbColumnName(groupingColId); // Use mapped name
+            if (!dbGroupingColName) {
+                console.error(`Cannot perform grouping for unmapped column field: ${groupingColId}`);
+                params.fail();
+                return;
+            }
+            console.log(`[ServerSideDatasource] Requesting GROUP level ${groupKeys.length} for column: ${dbGroupingColName}`);
+            
+            // Base query for grouping
+            let groupQueryBase = supabase.from('EPD');
+            groupQueryBase = applyParentFilters(groupQueryBase); // Apply filters from parent groups
+            // Apply regular column filters as well
+            // Select only the grouping column for distinct check
+            let groupQuery = applyFilters(groupQueryBase.select(dbGroupingColName, { count: 'exact' }), filterModel); 
+
+            // --- Simplified Group Fetching (Not Scalable - Needs RPC for Production) --- 
+            try {
+                // Attempt to get distinct values - very inefficient for large tables
+                groupQuery = groupQuery.order(dbGroupingColName, { ascending: true }); 
+                // Limit the scan range - this means we might miss groups!
+                groupQuery = groupQuery.range(0, 1000); // Example limit
+
+                console.log(`Executing Supabase GROUP query for ${dbGroupingColName}`, { groupKeys, filterModel });
+                const { data, error, count } = await groupQuery;
+
+                if (error) throw error;
+
+                // Extract distinct, non-null values from the limited data fetched
+                const distinctGroups = Array.from(new Set(data?.map(row => row[groupingColId]))) // Use original field name for mapping back
+                                          .filter(groupVal => groupVal !== null && groupVal !== undefined) // Filter out null/undefined groups
+                                          .map(groupVal => ({ [groupingColId]: groupVal })); // Format for grid using original field name
+
+                console.log(`Found ${distinctGroups.length} distinct groups (limited scan) for ${dbGroupingColName}`);
+                
+                // Since we limited the scan, we don't know the true total group count. 
+                // Pass -1 to AG-Grid to indicate unknown count (triggers infinite scroll for groups).
+                // Alternatively, if count represents total rows matching filters (not distinct groups), it's less useful here.
+                params.success({ rowData: distinctGroups, rowCount: -1 }); // Indicate unknown total group count
+
+            } catch (err) {
+                console.error(`Error fetching GROUP data for ${dbGroupingColName}:`, err);
+                params.fail();
+            }
+            // --- End Simplified Group Fetching --- 
+
+        } else {
+            // --- Request for Leaf Rows --- 
+            console.log('[ServerSideDatasource] Requesting LEAF rows within group:', groupKeys);
+            
+            // Base query for leaf rows
+            let leafQueryBase = supabase.from('EPD');
+            leafQueryBase = applyParentFilters(leafQueryBase); // Apply filters from parent groups
+            // Apply regular column filters
+            let leafQuery = applyFilters(leafQueryBase.select('*', { count: 'exact' }), filterModel);
+
+            // Apply sorting
+            if (sortModel && sortModel.length > 0) {
+                sortModel.forEach(s => {
+                    const dbSortColName = getDbColumnName(s.colId); // Use mapped name
+                    if(dbSortColName) {
+                      leafQuery = leafQuery.order(dbSortColName, { ascending: s.sort === 'asc' });
+                    }
+                });
+            } else {
+                // Optional default sort for leaf rows
+                // const defaultSortCol = getDbColumnName('id'); // Example using mapped default
+                // if(defaultSortCol) leafQuery = leafQuery.order(defaultSortCol, { ascending: true }); 
+            }
+
+            // Apply pagination (range)
+            const pageStartRow = startRow ?? 0;
+            // Use cacheBlockSize from gridOptions or default if endRow is missing
+            const cacheBlockSize = gridRef.current?.api?.getGridOption('cacheBlockSize') ?? 100;
+            const pageEndRow = endRow ?? (pageStartRow + cacheBlockSize);
+            leafQuery = leafQuery.range(pageStartRow, pageEndRow - 1);
+
+            // Execute the query
+            try {
+                console.log(`Executing Supabase LEAF query: range(${pageStartRow}, ${pageEndRow - 1})`, { groupKeys, sortModel, filterModel });
+                const { data, error, count } = await leafQuery;
+
+                if (error) {
+                    console.error('Supabase LEAF fetch error:', error);
+                    params.fail();
+                } else if (data) {
+                    const totalRowCount = count ?? 0; // Total leaf rows matching filters *within this group*
+                    const currentPageRowCount = data.length;
+                    console.log(`Supabase LEAF fetch success: Received ${currentPageRowCount} rows. Total count for group: ${totalRowCount}`);
+                    const lastRow = totalRowCount < 0 ? -1 : totalRowCount; 
+                    params.success({ 
+                        rowData: data,
+                        rowCount: lastRow, 
+                    });
+                } else {
+                    console.log('Supabase returned no LEAF data and no error.');
+                    params.success({ rowData: [], rowCount: 0 });
+                }
+            } catch (err) {
+                console.error('Error executing Supabase LEAF query:', err);
+                params.fail();
+            }
+        }
+      },
     };
-
-    fetchData();
-  }, []);
-
-  if (loading) {
-    return <div style={containerStyle}>Loading EPD data from Supabase...</div>;
-  }
-
-  if (error) {
-    return <div style={containerStyle}>Error: {error}</div>;
-  }
+  }, [supabase]); // Add supabase as dependency
 
   return (
     <div style={containerStyle}>
       <div style={gridStyle} className="ag-theme-quartz">
         <AgGridReact
-          rowData={rowData}
+          ref={gridRef}
           columnDefs={columnDefs}
           defaultColDef={defaultColDef}
           autoGroupColumnDef={autoGroupColumnDef}
-          rowSelection={{
-            mode: 'multiRow',
-            checkboxes: true,
-            enableClickSelection: false,
-            groupSelects: 'descendants',
-          }}
+          rowModelType="serverSide"
+          serverSideDatasource={serverSideDatasource}
           rowGroupPanelShow={'always'}
-          pagination={true}
-          paginationPageSize={50}
-          paginationPageSizeSelector={[10, 25, 50, 100]}
+          cacheBlockSize={100}
+          maxBlocksInCache={10}
         />
       </div>
     </div>

@@ -1,13 +1,14 @@
 {
   "name": "ag-grid-example",
   "dependencies": {
+    "@ag-grid-community/infinite-row-model": "^32.3.5",
+    "@ag-grid-community/react": "^32.3.5",
     "@supabase/supabase-js": "^2.49.4",
     "@types/react": "18",
     "@types/react-dom": "18",
-    "ag-grid-community": "33.2.4",
-    "ag-grid-enterprise": "33.2.4",
-    "ag-grid-react": "33.2.4",
     "ag-charts-enterprise": "~11.2.4",
+    "ag-grid-enterprise": "^33.2.4",
+    "ag-grid-react": "33.2.4",
     "react": "18",
     "react-dom": "18"
   },
